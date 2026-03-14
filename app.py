@@ -954,7 +954,7 @@ def render_footer():
         """
         <style>
         .custom-footer {
-            margin-top: 40px;
+            margin-top: 120px;
             text-align: center;
             color: gray;
             font-size: 0.9rem;
