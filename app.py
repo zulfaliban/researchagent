@@ -948,6 +948,28 @@ These scores are heuristic impact signals and are best used for ranking within t
 The agent ranks papers, always showing **primary** papers first, then secondary ones. For the top N that you choose, it shows metadata, relevance signals, and links to arXiv and the PDF. In LLM API mode it also adds plain English summaries. All artifacts and a markdown report are saved in a project folder under `~/arxiv_ai_digest_projects/project_<timestamp>`, and you can download everything as a ZIP.
 """
 
+# footer
+def render_footer():
+    st.markdown(
+        """
+        <style>
+        .custom-footer {
+            margin-top: 40px;
+            text-align: center;
+            color: gray;
+            font-size: 0.9rem;
+            padding-top: 20px;
+            padding-bottom: 10px;
+        }
+        </style>
+
+        <div class="custom-footer">
+            © The Benevolent Bandwidth Foundation, Inc. · Massachusetts Nonprofit Corporation. All rights reserved.<br>
+            Built with ❤️ for humanity
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 def main():
     st.set_page_config(
@@ -1307,6 +1329,8 @@ def main():
 
     if not run_clicked and "ranked_papers" not in st.session_state:
         st.info("Fill in your research brief and settings in the sidebar, then click **Run Pipeline**.")
+        # adding footer render:
+        render_footer()
         return
 
     # 1. Project setup
@@ -1936,46 +1960,9 @@ These scores are heuristic and should be used as a guide for exploration rather 
         file_name=f"research_agent_{timestamp}.zip",
         mime="application/zip",
     )
-
-# # Footer starts:
-#     st.markdown("---")
-#     st.markdown(
-#         """
-#         <div style="text-align: center; color: gray; font-size: 0.9rem; padding: 1rem 0;">
-#             © The Benevolent Bandwidth Foundation, Inc. · Massachusetts Nonprofit Corporation. All rights reserved.<br>
-#             Built with ❤️ for humanity
-#         </div>
-#         """,
-#         unsafe_allow_html=True,
-#     )
-
-    st.markdown(
-        """
-        <style>
-        .app-footer {
-            position: fixed;
-            left: 0;
-            bottom: 0;
-            width: 100%;
-            background-color: white;
-            color: gray;
-            text-align: center;
-            padding: 10px 0;
-            font-size: 0.9rem;
-            border-top: 1px solid #e6e6e6;
-            z-index: 999;
-        }
-        </style>
-
-        <div class="app-footer">
-            © The Benevolent Bandwidth Foundation, Inc. · Massachusetts Nonprofit Corporation. All rights reserved.<br>
-            Built with ❤️ for humanity
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-# Footer ends
+    
+# footer:
+    render_footer()
 
 if __name__ == "__main__":
     main()
