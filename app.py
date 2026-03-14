@@ -985,7 +985,6 @@ def main():
     )
     # We define a function to call at every exit point
     def render_footer():
-        st.markdown("---")
         st.markdown(
             """
             <div class="page-footer">
