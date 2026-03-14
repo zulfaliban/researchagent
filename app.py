@@ -955,6 +955,42 @@ def main():
         layout="wide",
     )
 
+    # ===== STICKY FOOTER (always visible, injected early so no early return can skip it) =====
+    st.markdown(
+        """
+        <style>
+        .sticky-footer {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            width: 100%;
+            background-color: #0e1117;
+            text-align: center;
+            color: gray;
+            font-size: 0.85rem;
+            padding: 0.6rem 0;
+            z-index: 9999;
+            border-top: 1px solid #333;
+        }
+        @media (prefers-color-scheme: light) {
+            .sticky-footer {
+                background-color: #ffffff;
+                border-top: 1px solid #ddd;
+            }
+        }
+        .block-container {
+            padding-bottom: 4rem !important;
+        }
+        </style>
+        <div class="sticky-footer">
+            &copy; The Benevolent Bandwidth Foundation, Inc. &middot; Massachusetts Nonprofit Corporation. All rights reserved.<br>
+            Built with ❤️ for humanity
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    # ===== END STICKY FOOTER =====
+
     st.title("🔎 Research Agent")
 
     
@@ -1937,17 +1973,6 @@ These scores are heuristic and should be used as a guide for exploration rather 
         mime="application/zip",
     )
 
-# Adding footer
-    st.markdown("---")
-    st.markdown(
-        """
-        <div style="text-align: center; color: gray; font-size: 0.9rem; padding: 1rem 0;">
-            © The Benevolent Bandwidth Foundation, Inc. · Massachusetts Nonprofit Corporation. All rights reserved.<br>
-            Built with ❤️ for humanity
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
 if __name__ == "__main__":
     main()
