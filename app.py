@@ -949,27 +949,6 @@ The agent ranks papers, always showing **primary** papers first, then secondary 
 """
 
 # footer
-# def render_footer():
-#     st.markdown(
-#         """
-#         <style>
-#         .custom-footer {
-#             margin-top: 70vh;
-#             text-align: center;
-#             color: gray;
-#             font-size: 0.9rem;
-#             padding-top: 20px;
-#             padding-bottom: 10px;
-#         }
-#         </style>
-
-#         <div class="custom-footer">
-#             © The Benevolent Bandwidth Foundation, Inc. · Massachusetts Nonprofit Corporation. All rights reserved.<br>
-#             Built with ❤️ for humanity
-#         </div>
-#         """,
-#         unsafe_allow_html=True,
-#     )
 
 def render_footer():
     st.markdown(
