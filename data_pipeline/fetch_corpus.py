@@ -353,7 +353,7 @@ def run_ingestion(
     incremental: bool = True,
     arxiv_only: bool = False,
     s2_only: bool = False,
-    days: int = 30,
+    days: int = 15,
 ) -> int:
     """
     End-to-end ingestion: fetch papers from arXiv (Scout) and/or S2 (Analyzer), upsert into SQLite.
@@ -410,7 +410,7 @@ if __name__ == "__main__":
     parser.add_argument("--full", action="store_true", help="Full refresh (longer window)")
     parser.add_argument("--arxiv", action="store_true", help="Only fetch from arXiv API (Scout)")
     parser.add_argument("--s2", action="store_true", help="Only fetch from Semantic Scholar (Analyzer)")
-    parser.add_argument("--days", type=int, default=30, help="Days to look back for arXiv Scout (default: 30)")
+    parser.add_argument("--days", type=int, default=15, help="Days to look back for arXiv Scout (default: 15)")
     args = parser.parse_args()
 
     logging.basicConfig(

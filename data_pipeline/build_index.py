@@ -56,6 +56,7 @@ def embed_papers(
     Returns float32 ndarray of shape (N, dim), L2-normalised.
     """
     from sentence_transformers import SentenceTransformer  # lazy import
+    import gc
 
     model = SentenceTransformer(model_name)
     texts = [
@@ -69,6 +70,11 @@ def embed_papers(
         convert_to_numpy=True,
         normalize_embeddings=True,
     )
+    
+    # Explicitly unload model to free memory for merging
+    del model
+    gc.collect()
+    
     return vecs.astype("float32")
 
 
@@ -108,6 +114,8 @@ def run_index_build(
     output_dir: str = "data_pipeline",
     model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
     force_full: bool = False,
+    update_arxiv_ts: bool = False,
+    update_s2_ts: bool = False,
 ) -> None:
     """
     Incremental index build pipeline:
@@ -148,12 +156,17 @@ def run_index_build(
         d["authors"] = json.loads(d.get("authors") or "[]")
         new_papers.append(d)
 
-    # 2. Re-load existing artifacts or start fresh
+    # 2. Embed new papers FIRST (heavy model in memory)
+    logger.info("Embedding %d new papers…", len(new_papers))
+    new_embeddings = embed_papers(new_papers, model_name)
+
+    # 3. Reload existing artifacts SECOND (heavy matrix in memory)
     has_artifacts = all(os.path.exists(p) for p in [emb_path, faiss_path, id_map_path])
     
     if has_artifacts and not force_full:
         try:
-            existing_embeddings = np.load(emb_path)
+            # Use mmap_mode='r' to save physical memory on Windows
+            existing_embeddings = np.load(emb_path, mmap_mode='r')
             existing_index = faiss.read_index(faiss_path)
             with open(id_map_path, "r", encoding="utf-8") as fh:
                 id_map = json.load(fh)
@@ -169,12 +182,9 @@ def run_index_build(
         id_map = {}
         logger.info("Starting fresh index build.")
 
-    # 3. Embed new papers
-    logger.info("Embedding %d new papers…", len(new_papers))
-    new_embeddings = embed_papers(new_papers, model_name)
-    
     # 4. Merge
     if existing_embeddings is not None:
+        # Note: np.vstack will load mmap'd segments temporarily
         all_embeddings = np.vstack([existing_embeddings, new_embeddings])
         existing_index.add(new_embeddings)
         all_index = existing_index
@@ -188,10 +198,24 @@ def run_index_build(
         id_map[str(start_idx + i)] = p["arxiv_id"]
 
     # 5. Save all updated artifacts
+    # On Windows, we must delete the mmap object before overwriting the file
+    if existing_embeddings is not None:
+        del existing_embeddings
+        import gc
+        gc.collect()
+
     np.save(emb_path, all_embeddings.astype("float32"))
     faiss.write_index(all_index, faiss_path)
     with open(id_map_path, "w", encoding="utf-8") as fh:
         json.dump(id_map, fh)
+    
+    # Capture metadata before freeing memory
+    faiss_ntotal = all_index.ntotal
+
+    # Free up memory before rebuilding BM25
+    del all_embeddings
+    del all_index
+    gc.collect()
     
     # 6. Update Database
     logger.info("Updating database flags...")
@@ -201,25 +225,41 @@ def run_index_build(
 
     # 7. Rebuild BM25
     # Always rebuild from all indexed papers to maintain global IDF statistics
-    logger.info("Rebuilding BM25 index for all papers…")
+    logger.info("Rebuilding BM25 index for all papers...")
     all_papers_rows = conn.execute("SELECT * FROM papers WHERE is_indexed = 1").fetchall()
-    all_papers = []
-    for r in all_papers_rows:
-        all_papers.append(dict(r))
-    
+    all_papers = [dict(r) for r in all_papers_rows]
+
     bm25_dir = os.path.join(output_dir, "bm25_index")
     build_bm25_index(all_papers, bm25_dir)
 
     # 8. Write Step Metadata
     from datetime import datetime
     meta_path = os.path.join(output_dir, "build_meta.json")
+    
+    existing_meta = {}
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                existing_meta = json.load(fh)
+        except: pass
+
+    last_arxiv = existing_meta.get("last_arxiv_at")
+    last_s2 = existing_meta.get("last_s2_at")
+    from datetime import timezone
+    now_iso = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0).isoformat() + "Z"
+    
     meta = {
-        "built_at": datetime.utcnow().isoformat() + "Z",
+        "built_at": now_iso,
+        "last_arxiv_at": last_arxiv or now_iso,
+        "last_s2_at": last_s2 or now_iso,
         "corpus_size": len(all_papers),
-        "faiss_ntotal": all_index.ntotal,
+        "faiss_ntotal": faiss_ntotal,
         "db_size_bytes": os.path.getsize(db_path),
         "schema_version": 1
     }
+    if update_arxiv_ts: meta["last_arxiv_at"] = now_iso
+    if update_s2_ts: meta["last_s2_at"] = now_iso
+
     with open(meta_path, "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=2)
     logger.info("Metadata saved: %s", meta_path)
@@ -229,9 +269,18 @@ def run_index_build(
 
 
 if __name__ == "__main__":
-    import sys
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--full", action="store_true", help="Force full rebuild")
+    parser.add_argument("--update-arxiv", action="store_true", help="Update last_arxiv_at timestamp")
+    parser.add_argument("--update-s2", action="store_true", help="Update last_s2_at timestamp")
+    args = parser.parse_args()
+
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
-    force = "--full" in sys.argv
-    run_index_build(force_full=force)
+    run_index_build(
+        force_full=args.full,
+        update_arxiv_ts=args.update_arxiv,
+        update_s2_ts=args.update_s2
+    )
