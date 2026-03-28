@@ -75,4 +75,5 @@ def test_hybrid_retrieval(dummy_papers):
     
     print("Top 5 candidates:")
     for i, c in enumerate(candidates[:5]):
-        print(f" {i+1}. {c.title} ({c.semantic_relevance:.4f})")
+        score = c.semantic_relevance if c.semantic_relevance is not None else 0.0
+        print(f" {i+1}. {c.title} ({score:.4f})")
