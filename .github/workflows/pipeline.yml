@@ -21,6 +21,12 @@ on:
         default: false
         type: boolean
 
+# Explicit write permission so the job can push build_meta.json back to the repo.
+# Without this, GitHub rejects the push with HTTP 403 even if GH_PAT is set,
+# because the default GITHUB_TOKEN only has read permissions for workflows.
+permissions:
+  contents: write
+
 jobs:
   build-and-sync:
     runs-on: ubuntu-latest
@@ -37,7 +43,8 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with:
-        # Check out the main branch with a PAT
+        # GH_PAT must have 'repo' (classic) or 'contents: write' (fine-grained) scope.
+        # persist-credentials=true (default) keeps it active for the git push step.
         token: ${{ secrets.GH_PAT }}
         ref: main
     
@@ -82,6 +89,12 @@ jobs:
       run: |
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
+
+        # Explicitly re-authenticate the remote with GH_PAT.
+        # This is the most reliable way to ensure the push is authorised,
+        # even if the PAT scope is limited to 'contents: write' (fine-grained).
+        git remote set-url origin https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ github.repository }}.git
+
         git add data_pipeline/build_meta.json
         if ! git diff --staged --quiet; then
           git commit -m "chore(pipeline): daily corpus update $(date -u +%Y-%m-%dT%H:%M:%SZ) [skip ci]"
