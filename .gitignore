@@ -38,5 +38,4 @@ data_pipeline/corpus.db
 data_pipeline/corpus_smoke.db
 data_pipeline/bm25_index/
 data_pipeline/id_map.json
-data_pipeline/build_meta.json
 logs/

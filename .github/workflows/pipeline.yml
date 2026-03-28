@@ -37,9 +37,9 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with:
-        # Check out the testing branch with a PAT
+        # Check out the main branch with a PAT
         token: ${{ secrets.GH_PAT }}
-        ref: ag/issue2
+        ref: main
     
     - name: Set up Python 3.11
       uses: actions/setup-python@v5
@@ -85,7 +85,7 @@ jobs:
         git add data_pipeline/build_meta.json
         if ! git diff --staged --quiet; then
           git commit -m "chore(pipeline): daily corpus update $(date -u +%Y-%m-%dT%H:%M:%SZ) [skip ci]"
-          git push origin ag/issue2
+          git push origin main
         else
           echo "No changes to build_meta.json. Skipping commit."
         fi
