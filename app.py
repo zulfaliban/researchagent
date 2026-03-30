@@ -151,7 +151,7 @@ def get_corpus_dir() -> pathlib.Path:
             pass
     # 4. Final Fallback: Platform-agnostic system temp directory
     # This ensures it works on Windows, Linux, and Mac regardless of cloud provider.
-    temp_path = pathlib.Path(tempfile.gettempdir()) / "researchagent_corpus"
+    temp_path = pathlib.Path(tempfile.gettempdir()) / "researchagent_test"
     temp_path.mkdir(parents=True, exist_ok=True)
     return temp_path
 
