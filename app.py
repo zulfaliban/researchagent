@@ -106,6 +106,8 @@ def get_date_range(option: str) -> (date, date):
         return today - timedelta(days=7), today
     elif option == "Last Month":
         return today - timedelta(days=30), today
+    elif option == "All Time":
+        return date(2000, 1, 1), today
     else:
         raise ValueError(f"Unknown date range option: {option}")
 
@@ -123,39 +125,17 @@ def save_json(path: str, obj: Any):
 def get_corpus_dir() -> pathlib.Path:
     """
     Returns the writable directory for data pipeline artifacts.
-
-    Priority:
-      1. CORPUS_DATA_DIR env var  (explicit override)
-      2. ./data_pipeline/         (local dev — only if writable)
-      3. <tempdir>/researchagent_corpus  (Streamlit Cloud / read-only containers)
-
-    The folder name in step 3 is always 'researchagent_corpus' — it is NOT
-    tied to the R2 bucket name so it stays stable across bucket renames.
+    Always uses a platform-agnostic temp directory to ensure the app 
+    relies exclusively on R2 as the single source of truth.
     """
-    # 1. Manual override
+    # 1. Manual override (mainly for CI/CD or explicit local overrides)
     env_dir = os.environ.get("CORPUS_DATA_DIR")
     if env_dir:
         p = pathlib.Path(env_dir)
         p.mkdir(parents=True, exist_ok=True)
         return p
 
-    # 2. Local dev: use the repo data_pipeline/ folder if it is writable
-    # STREAMLIT_SHARING_MODE is auto-set by Streamlit Cloud — never set it manually.
-    is_cloud = os.getenv("STREAMLIT_SHARING_MODE") is not None
-    if not is_cloud:
-        local_dir = pathlib.Path("data_pipeline")
-        try:
-            local_dir.mkdir(parents=True, exist_ok=True)
-            probe = local_dir / ".write_test"
-            probe.touch()
-            probe.unlink()
-            return local_dir
-        except (OSError, PermissionError):
-            pass  # repo is read-only → fall through to temp
-
-    # 3. Streamlit Cloud / read-only environments → writable system temp
-    # Folder name is fixed so every call within a container session resolves
-    # to the same path (important for @st.cache_resource consistency).
+    # 2. Always fallback to system temp directory (Streamlit Cloud & local usage matches)
     temp_path = pathlib.Path(tempfile.gettempdir()) / "researchagent_corpus"
     temp_path.mkdir(parents=True, exist_ok=True)
     return temp_path
@@ -232,10 +212,10 @@ def download_corpus_artifacts():
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     # 1. Resolve credentials: st.secrets (Streamlit Cloud) → os.getenv (.env / GitHub Actions)
-    key_id    = st.secrets.get("R2_ACCESS_KEY_ID")     or os.getenv("R2_ACCESS_KEY_ID")
-    access_key = st.secrets.get("R2_SECRET_ACCESS_KEY") or os.getenv("R2_SECRET_ACCESS_KEY")
-    endpoint   = st.secrets.get("R2_ENDPOINT")          or os.getenv("R2_ENDPOINT")
-    bucket     = st.secrets.get("R2_BUCKET")            or os.getenv("R2_BUCKET")
+    key_id    = (st.secrets.get("R2_ACCESS_KEY_ID")     or os.getenv("R2_ACCESS_KEY_ID", "")).strip().strip('\'"')
+    access_key = (st.secrets.get("R2_SECRET_ACCESS_KEY") or os.getenv("R2_SECRET_ACCESS_KEY", "")).strip().strip('\'"')
+    endpoint   = (st.secrets.get("R2_ENDPOINT")          or os.getenv("R2_ENDPOINT", "")).strip().strip('\'"')
+    bucket     = (st.secrets.get("R2_BUCKET")            or os.getenv("R2_BUCKET", "")).strip().strip('\'"')
 
     if not all([key_id, access_key, endpoint, bucket]):
         st.warning("⚠️ R2 credentials not fully configured. Corpus sync skipped.")
@@ -1440,7 +1420,7 @@ def _main_body():
 
         
 
-        date_option = st.selectbox("Date Range", ["Last 3 Days", "Last Week", "Last Month"])
+        date_option = st.selectbox("Date Range", ["Last 3 Days", "Last Week", "Last Month", "All Time"], index=2)
 
         st.markdown("### ⭐ Top N Highlight")
         top_n = st.slider(
