@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, date
 from typing import List, Optional, Dict, Any
 import numpy as np
 import pathlib
+import tempfile
 
 try:
     import streamlit as st
@@ -120,14 +121,39 @@ def save_json(path: str, obj: Any):
 
 
 def get_corpus_dir() -> pathlib.Path:
-    """Returns the writable directory for data pipeline artifacts."""
+    """
+    Returns the writable directory for data pipeline artifacts.
+    Checks environment variables, local folder writability, and falls back
+    to a platform-agnostic temp directory (crucial for Cloud deployments).
+    """
+    # 1. Manual override via environment variable
+    env_dir = os.environ.get("CORPUS_DATA_DIR")
+    if env_dir:
+        p = pathlib.Path(env_dir)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
     local_dir = pathlib.Path("data_pipeline")
-    # In Streamlit Cloud and most containers, /tmp is always writable.
-    # Check if we are running in a deployed environment or if local data_pipeline is missing/not writable.
+    
+    # 2. Check for Streamlit Cloud or forced cloud mode
     is_streamlit_cloud = os.getenv("STREAMLIT_SHARING_MODE") is not None
-    if is_streamlit_cloud or not local_dir.exists():
-        return pathlib.Path("/tmp/data_pipeline")
-    return local_dir
+    
+    # 3. If NOT on cloud, try using the local project folder (ideal for local dev)
+    if not is_streamlit_cloud:
+        try:
+            local_dir.mkdir(parents=True, exist_ok=True)
+            # Verify writability by touching a dummy file
+            test_file = local_dir / ".write_test"
+            test_file.touch()
+            test_file.unlink()
+            return local_dir
+        except (OSError, PermissionError):
+            # If local directory is read-only (common in many cloud setups)
+            pass
+    # 4. Final Fallback: Platform-agnostic system temp directory
+    # This ensures it works on Windows, Linux, and Mac regardless of cloud provider.
+    temp_path = pathlib.Path(tempfile.gettempdir()) / "researchagent_test"
+    temp_path.mkdir(parents=True, exist_ok=True)
+    return temp_path
 
 
 def _check_corpus_freshness():
