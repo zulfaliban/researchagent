@@ -1,0 +1,100 @@
+name: Daily Corpus Pipeline
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # 02:00 UTC daily
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Pipeline Mode'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - arxiv
+          - s2
+          - sync
+      full_rebuild:
+        description: 'Force Full Rebuild'
+        required: false
+        default: false
+        type: boolean
+
+# Grant the built-in GITHUB_TOKEN write access so the job can push
+# build_meta.json back to the repo without requiring a personal access token.
+permissions:
+  contents: write
+
+jobs:
+  build-and-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    env:
+      S2_API_KEY: ${{ secrets.S2_API_KEY }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      RCLONE_REMOTE: r2
+
+    steps:
+    - uses: actions/checkout@v4
+      # No 'token' override needed — GITHUB_TOKEN is used automatically.
+      # It has write access because of the 'permissions: contents: write' block above.
+      with:
+        ref: main
+    
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        sudo apt-get install rclone -y
+        
+    - name: Configure rclone
+      run: |
+        mkdir -p ~/.config/rclone
+        cat > ~/.config/rclone/rclone.conf <<EOF
+        [r2]
+        type = s3
+        provider = Cloudflare
+        access_key_id = $R2_ACCESS_KEY_ID
+        secret_access_key = $R2_SECRET_ACCESS_KEY
+        endpoint = $R2_ENDPOINT
+        acl = private
+        EOF
+        
+    - name: Restore from R2
+      run: |
+        python data_pipeline/restore_from_r2.py
+        
+    - name: Run Pipeline
+      run: |
+        MODE=${{ github.event.inputs.mode || 'all' }}
+        FULL=${{ github.event.inputs.full_rebuild == 'true' && '--full' || '' }}
+        
+        echo "Running mode: $MODE $FULL"
+        python data_pipeline/scheduler.py $MODE $FULL
+        
+    - name: Commit build_meta.json back to main
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+        # Inject the built-in GITHUB_TOKEN into the remote URL for the push.
+        # This is equivalent to GH_PAT but requires no manual secret management.
+        git remote set-url origin https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git
+
+        git add data_pipeline/build_meta.json
+        if ! git diff --staged --quiet; then
+          git commit -m "chore(pipeline): daily corpus update $(date -u +%Y-%m-%dT%H:%M:%SZ) [skip ci]"
+          git push origin main
+        else
+          echo "No changes to build_meta.json. Skipping commit."
+        fi

@@ -8,8 +8,8 @@ __pycache__/
 .venv/
 venv/
 
-# Streamlit
-.streamlit/
+# Streamlit — only ignore secrets, NOT config.toml
+.streamlit/secrets.toml
 
 # OS files
 .DS_Store
@@ -19,3 +19,23 @@ venv/
 __pycache__/
 *.pyc
 arxiv_ai_digest_projects/
+.env
+
+# Artifacts
+docs/PLAN.md
+docs/DESIGN.md
+docs/WALKTHROUGH.md
+docs/TASKS.md
+docs/CHANGELOG.md
+docs/CODE_REVIEW.md
+.antigravity/
+.agent/
+
+# Data pipeline artifacts (Issue #2) — do not commit large binary indexes
+data_pipeline/*.faiss
+data_pipeline/*.npy
+data_pipeline/corpus.db
+data_pipeline/corpus_smoke.db
+data_pipeline/bm25_index/
+data_pipeline/id_map.json
+logs/

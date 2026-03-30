@@ -9,6 +9,9 @@ import re
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, date
 from typing import List, Optional, Dict, Any
+import numpy as np
+import pathlib
+import tempfile
 
 try:
     import streamlit as st
@@ -42,7 +45,7 @@ except ImportError:
 
 MIN_FOR_PREDICTION = 20
 OPENAI_EMBEDDING_MODEL_NAME = "text-embedding-3-large"
-GEMINI_EMBEDDING_MODEL_NAME = "text-embedding-004"
+GEMINI_EMBEDDING_MODEL_NAME = "gemini-embedding-001"
 
 # MONEYBALL DEFAULTS
 DEFAULT_MONEYBALL_WEIGHTS = {
@@ -97,6 +100,8 @@ def get_date_range(option: str) -> (date, date):
         return today - timedelta(days=7), today
     elif option == "Last Month":
         return today - timedelta(days=30), today
+    elif option == "All Time":
+        return date(2000, 1, 1), today
     else:
         raise ValueError(f"Unknown date range option: {option}")
 
@@ -109,6 +114,203 @@ def ensure_folder(path: str) -> str:
 def save_json(path: str, obj: Any):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, default=str)
+
+
+def get_corpus_dir() -> pathlib.Path:
+    """
+    Returns the writable directory for data pipeline artifacts.
+    Always uses a platform-agnostic temp directory to ensure the app 
+    relies exclusively on R2 as the single source of truth.
+    """
+    # 1. Manual override (mainly for CI/CD or explicit local overrides)
+    env_dir = os.environ.get("CORPUS_DATA_DIR")
+    if env_dir:
+        p = pathlib.Path(env_dir)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    # 2. Always fallback to system temp directory (Streamlit Cloud & local usage matches)
+    temp_path = pathlib.Path(tempfile.gettempdir()) / "researchagent_corpus"
+    temp_path.mkdir(parents=True, exist_ok=True)
+    return temp_path
+
+
+def _check_corpus_freshness():
+    """Lightweight per-search freshness check that reloads data in-place without restart."""
+    import time
+    import boto3
+    from botocore.exceptions import ClientError
+
+    # 1. Throttle: check R2 at most every 30 minutes per session to save egress/API calls
+    now = time.time()
+    last_check = st.session_state.get("_freshness_checked_at", 0)
+    if now - last_check < 1800: # 1800s = 30 min
+        return
+
+    # 2. Get credentials
+    access_key = st.secrets.get("R2_ACCESS_KEY_ID") or os.environ.get("R2_ACCESS_KEY_ID")
+    secret_key = st.secrets.get("R2_SECRET_ACCESS_KEY") or os.environ.get("R2_SECRET_ACCESS_KEY")
+    endpoint = st.secrets.get("R2_ENDPOINT") or os.environ.get("R2_ENDPOINT")
+    bucket_name = st.secrets.get("R2_BUCKET") or os.environ.get("R2_BUCKET")
+
+    if not all([access_key, secret_key, endpoint, bucket_name]):
+        return
+
+    try:
+        from botocore.config import Config
+        s3 = boto3.client(
+            's3',
+            endpoint_url=endpoint,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name="auto",
+            config=Config(signature_version="s3v4"),
+        )
+        
+        # 3. HEAD request to check ETag of the metadata file
+        response = s3.head_object(Bucket=bucket_name, Key="corpus/build_meta.json")
+        new_etag = response.get('ETag', '').strip('"')
+        old_etag = st.session_state.get("_corpus_etag")
+
+        if old_etag and new_etag == old_etag:
+            st.session_state["_freshness_checked_at"] = now
+            return
+
+        # 4. If ETag differs, refresh cached resources
+        if old_etag:
+            # We only show this if it's an actual update detected since session start
+            msg = st.info("New corpus data available — refreshing index (this takes ~20 seconds)...")
+            st.cache_resource.clear()
+            download_corpus_artifacts()
+            msg.empty()
+
+        st.session_state["_corpus_etag"] = new_etag
+        st.session_state["_freshness_checked_at"] = now
+
+    except Exception:
+        # Fail silently: data refresh is non-critical, we don't want to block the search
+        pass
+
+
+def download_corpus_artifacts():
+    """
+    Startup sync from Cloudflare R2 with freshness check.
+    Runs once per Streamlit session using session_state as a guard.
+    Downloads artifacts to get_corpus_dir() if the remote is newer.
+    """
+    # Guard: only run once per session (not on every Streamlit re-run)
+    if st.session_state.get("_corpus_synced"):
+        return
+
+    import boto3
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # 1. Resolve credentials: st.secrets (Streamlit Cloud) → os.getenv (.env / GitHub Actions)
+    key_id    = (st.secrets.get("R2_ACCESS_KEY_ID")     or os.getenv("R2_ACCESS_KEY_ID", "")).strip().strip('\'"')
+    access_key = (st.secrets.get("R2_SECRET_ACCESS_KEY") or os.getenv("R2_SECRET_ACCESS_KEY", "")).strip().strip('\'"')
+    endpoint   = (st.secrets.get("R2_ENDPOINT")          or os.getenv("R2_ENDPOINT", "")).strip().strip('\'"')
+    bucket     = (st.secrets.get("R2_BUCKET")            or os.getenv("R2_BUCKET", "")).strip().strip('\'"')
+
+    if not all([key_id, access_key, endpoint, bucket]):
+        st.warning("⚠️ R2 credentials not fully configured. Corpus sync skipped.")
+        st.session_state["_corpus_synced"] = True
+        return
+
+    corpus_dir = get_corpus_dir()
+    corpus_dir.mkdir(parents=True, exist_ok=True)
+    meta_path  = corpus_dir / "build_meta.json"
+    status     = st.empty()
+
+    try:
+        from botocore.config import Config
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            aws_access_key_id=key_id,
+            aws_secret_access_key=access_key,
+            region_name="auto",  # Required for Cloudflare R2
+            config=Config(signature_version="s3v4"),
+        )
+
+        # 2. Freshness check — compare local vs remote build_meta.json
+        status.info("🔍 Checking for fresh corpus updates on R2...")
+        local_meta = {}
+        if meta_path.exists():
+            try:
+                local_meta = json.load(open(meta_path, "r", encoding="utf-8"))
+            except Exception:
+                pass
+
+        remote_meta_obj = s3.get_object(Bucket=bucket, Key="corpus/build_meta.json")
+        remote_meta     = json.loads(remote_meta_obj["Body"].read().decode("utf-8"))
+
+        remote_ts  = remote_meta.get("built_at", "")
+        local_ts   = local_meta.get("built_at", "")
+        remote_ver = remote_meta.get("schema_version", 1)
+        local_ver  = local_meta.get("schema_version", 0)
+
+        if remote_ts == local_ts and remote_ver == local_ver and meta_path.exists():
+            status.empty()
+            st.session_state["_corpus_synced"] = True
+            return  # Already up-to-date
+
+        # 3. Download core flat files in parallel
+        corpus_size = remote_meta.get("corpus_size", "?")
+        status.info(f"🔄 Syncing corpus from R2 ({corpus_size:,} papers)...")
+
+        core_files = [
+            "corpus.db",
+            "index_minilm.faiss",
+            "embeddings_minilm.npy",
+            "id_map.json",
+            "build_meta.json",
+        ]
+
+        def _download_file(filename):
+            dest = corpus_dir / filename
+            s3.download_file(bucket, f"corpus/{filename}", str(dest))
+            size_mb = dest.stat().st_size / (1024 * 1024)
+            return filename, size_mb
+
+        failed_files = []
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {executor.submit(_download_file, f): f for f in core_files}
+            for future in as_completed(futures):
+                try:
+                    fname, size_mb = future.result()
+                except Exception as exc:
+                    failed_files.append(f"{futures[future]} ({exc})")
+
+        if failed_files:
+            status.error(f"❌ Corpus sync failed for: {', '.join(failed_files)}")
+            return  # Don't mark as synced — allow retry
+
+        # 4. BM25 index directory (non-fatal if missing)
+        bm25_dir = corpus_dir / "bm25_index"
+        bm25_dir.mkdir(exist_ok=True)
+        try:
+            paginator = s3.get_paginator("list_objects_v2")
+            bm25_count = 0
+            for page in paginator.paginate(Bucket=bucket, Prefix="corpus/bm25_index/"):
+                for obj in page.get("Contents", []):
+                    key      = obj["Key"]
+                    filename = key[len("corpus/bm25_index/"):]
+                    if filename:
+                        s3.download_file(bucket, key, str(bm25_dir / filename))
+                        bm25_count += 1
+        except Exception as bm25_err:
+            # BM25 failure is non-fatal — corpus.db + FAISS still work
+            st.warning(f"⚠️ BM25 index sync failed (BM25 retrieval disabled): {bm25_err}")
+
+        status.success("✅ Corpus synced from R2 successfully!")
+        time.sleep(1)
+        status.empty()
+        st.session_state["_corpus_synced"] = True
+
+    except Exception as e:
+        # Show a persistent error so it is always visible on-screen
+        status.error(f"❌ R2 corpus sync error: {e}")
+        # Do NOT set _corpus_synced = True so the next re-run retries
 
 
 def build_query_brief(research_brief: str, not_looking_for: str) -> str:
@@ -752,7 +954,8 @@ def predict_citations_direct(target_papers: List[Paper], llm_config: LLMConfig, 
             with open("moneyball_weights.json", "r") as f: weights = json.load(f)
         except: pass
     
-    s2_key = os.getenv("S2_API_KEY") 
+    # Read S2 key from st.secrets (Streamlit Cloud) with os.getenv fallback (local/.env)
+    s2_key = st.secrets.get("S2_API_KEY") or os.getenv("S2_API_KEY")
     progress_bar = st.progress(0)
     
     for i, p in enumerate(target_papers):
@@ -877,15 +1080,87 @@ def predict_citations_direct(target_papers: List[Paper], llm_config: LLMConfig, 
     progress_bar.empty()
     return target_papers
 
+def compute_keyword_match_score(paper: Paper, query_brief: str) -> float:
+    """
+    Lightweight keyword relevance score in [0, 1].
+    Uses overlap between meaningful query terms and the paper title/abstract.
+    """
+    text = f"{paper.title} {paper.abstract}".lower()
+    query = query_brief.lower()
 
-def assign_heuristic_citations_free(papers: List[Paper]) -> List[Paper]:
-    if not papers: return papers
-    scores = [(p.llm_relevance_score or 0.0) * 0.7 + (p.semantic_relevance or 0.0) * 0.3 for p in papers]
-    if not scores: return papers
-    min_s, max_s = min(scores), max(scores)
-    for p, s in zip(papers, scores):
+    stopwords = {
+        "the", "and", "or", "for", "with", "that", "this", "from", "into", "about",
+        "what", "are", "your", "their", "they", "them", "using", "used", "use",
+        "main", "whose", "where", "when", "which", "have", "has", "had", "been",
+        "being", "also", "only", "just", "more", "most", "very", "much", "some",
+        "such", "than", "then", "over", "under", "not", "without", "within",
+        "papers", "paper", "interested", "looking", "brief", "contribution"
+    }
+
+    query_terms = re.findall(r"\b[a-zA-Z][a-zA-Z\-]+\b", query)
+    query_terms = [t for t in query_terms if len(t) > 2 and t not in stopwords]
+
+    if not query_terms:
+        return 0.0
+
+    matched = sum(1 for term in set(query_terms) if term in text)
+    return min(matched / max(len(set(query_terms)), 1), 1.0)
+
+
+def compute_recency_score(submitted_date: datetime, max_days: int = 30) -> float:
+    """
+    Returns a recency score in [0, 1], where newer papers score higher.
+    """
+    try:
+        days_old = max((datetime.now().date() - submitted_date.date()).days, 0)
+    except Exception:
+        return 0.0
+
+    if days_old >= max_days:
+        return 0.0
+
+    return 1.0 - (days_old / max_days)
+
+def assign_heuristic_citations_free(papers: List[Paper], query_brief: str) -> List[Paper]:
+    if not papers:
+        return papers
+
+    raw_scores = []
+
+    for p in papers:
+        semantic_score = p.semantic_relevance or 0.0
+        keyword_score = compute_keyword_match_score(p, query_brief)
+        recency_score = compute_recency_score(p.submitted_date)
+
+        # Minimal multi-signal scoring
+        final_score = (
+            0.60 * semantic_score +
+            0.25 * keyword_score +
+            0.15 * recency_score
+        )
+
+        raw_scores.append(final_score)
+
+        # Optional lightweight explanation for free mode
+        reasons = []
+        if keyword_score >= 0.3:
+            reasons.append("strong keyword overlap with the research brief")
+        if semantic_score >= 0.3:
+            reasons.append("high semantic similarity to the query")
+        if recency_score >= 0.8:
+            reasons.append("very recent submission")
+
+        if reasons:
+            p.semantic_reason = "Matched due to " + ", ".join(reasons) + "."
+        elif p.semantic_reason is None:
+            p.semantic_reason = "Matched using a hybrid free-mode heuristic."
+
+    min_s, max_s = min(raw_scores), max(raw_scores)
+
+    for p, s in zip(papers, raw_scores):
         norm = (s - min_s) / (max_s - min_s) if max_s > min_s else 0.5
         p.predicted_citations = float(int(10 + norm * 40))
+
     return papers
 
 
@@ -947,6 +1222,33 @@ These scores are heuristic impact signals and are best used for ranking within t
 
 The agent ranks papers, always showing **primary** papers first, then secondary ones. For the top N that you choose, it shows metadata, relevance signals, and links to arXiv and the PDF. In LLM API mode it also adds plain English summaries. All artifacts and a markdown report are saved in a project folder under `~/arxiv_ai_digest_projects/project_<timestamp>`, and you can download everything as a ZIP.
 """
+
+def _bibtex_key_from_paper(p: Paper) -> str:
+    # key like: smith2026_arxiv2503.12345
+    if p.authors:
+        first = p.authors[0].split()[-1]
+        base = re.sub(r"[^A-Za-z0-9]+", "", first).lower() or "paper"
+    else:
+        base = "paper"
+    year = str(p.submitted_date.year) if p.submitted_date else "nd"
+    arx = (p.arxiv_id or "").split("v")[0].replace(".", "")
+    suffix = f"_arxiv{arx}" if arx else ""
+    return f"{base}{year}{suffix}"
+
+def generate_bibtex_from_paper(p: Paper) -> str:
+    key = _bibtex_key_from_paper(p)
+    authors = " and ".join(p.authors) if p.authors else ""
+    title = (p.title or "").replace("{", "").replace("}", "")
+    year = str(p.submitted_date.year) if p.submitted_date else ""
+    url = p.arxiv_url or p.pdf_url or ""
+    return (
+        f"@article{{{key},\n"
+        f"  title={{ {title} }},\n"
+        f"  author={{ {authors} }},\n"
+        f"  year={{ {year} }},\n"
+        f"  url={{ {url} }}\n"
+        f"}}\n"
+    )
 
 
 def main():
@@ -1096,7 +1398,7 @@ def _main_body():
 
         
 
-        date_option = st.selectbox("Date Range", ["Last 3 Days", "Last Week", "Last Month"])
+        date_option = st.selectbox("Date Range", ["Last 3 Days", "Last Week", "Last Month", "All Time"], index=2)
 
         st.markdown("### ⭐ Top N Highlight")
         top_n = st.slider(
@@ -1180,11 +1482,11 @@ def _main_body():
 
             # Updated Gemini models list including Gemini 3 Preview
             gemini_models = [
-                "gemini-3-pro-preview",
+                "gemini-3.1-pro-preview",
+                "gemini-3.1-flash-lite-preview",
                 "gemini-3-flash-preview",
-                "gemini-2.5-flash",
                 "gemini-2.5-pro",
-                "gemini-2.0-flash-exp",
+                "gemini-2.5-flash",
             ]
             gemini_choice = st.selectbox(
                 "Gemini Chat model (for classification & citation impact scoring)",
@@ -1194,8 +1496,8 @@ def _main_body():
             if gemini_choice == "Custom":
                 model_name = st.text_input(
                     "Custom Gemini model name",
-                    value="gemini-3-pro-preview",
-                    help="Use the model identifier shown in Google AI Studio, for example `gemini-3-pro-preview`."
+                    value="gemini-3.1-pro-preview",
+                    help="Use the model identifier shown in Google AI Studio, for example `gemini-3.1-pro-preview`."
                 )
             else:
                 model_name = gemini_choice
@@ -1715,7 +2017,7 @@ These citation impact scores are heuristic and are best used for ranking within 
         st.markdown("""
 **How this step works (free local mode)**
 
-In free local mode, the agent does not call any external LLM. Instead, it combines the embedding based similarity and relevance scores into a single numeric citation impact score and uses that score as a proxy for how influential the paper might be relative to others in this batch. The absolute numbers are less important than the relative ranking.
+In free local mode, the agent does not call any external LLM. Instead, it uses a lightweight heuristic ranking method that combines semantic similarity, keyword relevance, and recency signals to assign a numeric citation impact proxy score within the current batch. The absolute numbers are less important than the relative ranking.
 
 These scores are heuristic and should be used as a guide for exploration rather than as formal evaluation metrics.
         """)
@@ -1729,7 +2031,7 @@ These scores are heuristic and should be used as a guide for exploration rather 
                 )
         else:
             with st.spinner("Computing heuristic citation impact scores from relevance signals..."):
-                papers_with_pred = assign_heuristic_citations_free(selected_papers)
+                papers_with_pred = assign_heuristic_citations_free(selected_papers, query_brief)
 
         # SEPARATE into groups by focus (Primary vs Secondary vs Others)
         primaries = [p for p in papers_with_pred if p.focus_label == "primary"]
@@ -1806,25 +2108,34 @@ These scores are heuristic and should be used as a guide for exploration rather 
 
     df = pd.DataFrame(table_rows)
 
-    if not df.empty:
-        st.dataframe(
-            df,
-            width='stretch',
-            hide_index=True,
-            column_config={
-                "arXiv": st.column_config.LinkColumn(
-                    label="arXiv",
-                    help="Open arXiv page",
-                    validate="^https?://.*",
-                    max_chars=100,
-                    display_text="arXiv link"
-                ),
-                "Citation impact score (1y)": st.column_config.TextColumn(
-                    label="Citation impact score (1y)",
-                    help="Score or 'Too new to rate'"
-                )
-            }
-        )
+ 
+    # --- CSV Export ---
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="⬇️ Download ranked results (CSV)",
+        data=csv_bytes,
+        file_name=f"ranked_papers_{timestamp}.csv",
+        mime="text/csv",
+    )
+
+    st.dataframe(
+        df,
+        width='stretch',
+        hide_index=True,
+        column_config={
+            "arXiv": st.column_config.LinkColumn(
+                label="arXiv",
+                help="Open arXiv page",
+                validate="^https?://.*",
+                max_chars=100,
+                display_text="arXiv link"
+            ),
+            "Citation impact score (1y)": st.column_config.TextColumn(
+                label="Citation impact score (1y)",
+                help="Score or 'Too new to rate'"
+            )
+        }
+    )
 
     # 8. Top N highlighted
     top_n_effective = min(top_n, len(ranked_papers))
@@ -1849,7 +2160,26 @@ These scores are heuristic and should be used as a guide for exploration rather 
         st.write(f"**Authors:** {', '.join(p.authors) if p.authors else 'Unknown'}")
         st.markdown(f"**Venue:** {p.venue or 'N/A'}")
         st.write(f"[arXiv link]({p.arxiv_url}) | [PDF link]({p.pdf_url})")
+        bibtex = generate_bibtex_from_paper(p)
 
+        col1, col2 = st.columns([1, 3])
+
+        with col1:
+            st.download_button(
+                label="Download BibTeX",
+                data=bibtex,
+                file_name=f"{(p.arxiv_id or f'paper_{rank}')}.bib",
+                mime="text/plain",
+                key=f"bib_dl_{p.arxiv_id or rank}",
+            )
+
+        with col2:
+            st.text_area(
+                "BibTeX (copy)",
+                value=bibtex,
+                height=140,
+                key=f"bib_txt_{p.arxiv_id or rank}",
+            )
         if provider in ("openai", "gemini", "groq"):
             paper_key = p.arxiv_id or p.title
             if paper_key in plain_summaries:
