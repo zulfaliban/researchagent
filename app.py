@@ -39,11 +39,6 @@ try:
 except ImportError:
     genai = None  # type: ignore
 
-try:
-    import bm25s
-except ImportError:
-    bm25s = None
-
 # =========================
 # Constants
 # =========================
@@ -91,7 +86,6 @@ class Paper:
     focus_label: Optional[str] = None
     llm_relevance_score: Optional[float] = None
     venue: Optional[str] = None
-    source: Optional[str] = None
 
 
 # =========================
@@ -480,74 +474,109 @@ def build_arxiv_category_query(
 
     return "(" + " OR ".join([f"cat:{c}" for c in cats]) + ")"
 
-def fetch_papers_from_db(
+
+
+# =========================
+# Robust arXiv fetching
+# =========================
+
+def fetch_arxiv_papers_by_date(
     start_date: date,
     end_date: date,
-    category_filter: Optional[str] = None,
-    subcats: Optional[List[str]] = None
+    arxiv_query: Optional[str] = None,
+    batch_size: int = 50,
+    max_batches: int = 100,
+    max_retries: int = 3,
 ) -> List[Paper]:
-    """
-    Fetch papers from the local SQLite 20k corpus.
-    Filters by submitted_date range, and optionally checks abstract/title
-    for subcategory keyword matches to simulate arXiv category filtering.
-    """
-    import os
-    import json
-    import sqlite3 as _sq
-    db_path = get_corpus_dir() / "corpus.db"
-    if not db_path.exists():
-        return []
+    query = arxiv_query or "(cat:cs.AI OR cat:cs.LG OR cat:cs.HC)"
+    base_url = "https://export.arxiv.org/api/query"
 
-    conn = _sq.connect(db_path, check_same_thread=False)
-    conn.row_factory = _sq.Row
-    
-    query = "SELECT * FROM papers WHERE date(submitted_date) >= date(?) AND date(submitted_date) <= date(?)"
-    params = [start_date.isoformat(), end_date.isoformat()]
-    
-    if category_filter and category_filter != "All":
-        query += " AND fields_of_study LIKE ?"
-        params.append(f"%{category_filter}%")
+    results: List[Paper] = []
+    seen_ids = set()
+    start_index = 0
 
-    if subcats and category_filter != "All":
-        or_clauses = []
-        for cat_code in subcats:
-            cat_name = ARXIV_CODE_TO_NAME.get(cat_code, cat_code)
-            # Remove minor stop words for better partial match
-            words = [w for w in cat_name.split() if w.lower() not in ('and', 'or', 'of')]
-            if words:
-                keyword = words[0]
-                if len(words) > 1:
-                    keyword = " ".join(words[:2]) # e.g. "Artificial Intelligence"
-                
-                # Check for either standard keyword simulation OR absolute 100% precision raw arXiv tag
-                or_clauses.append("(title LIKE ? OR abstract LIKE ? OR fields_of_study LIKE ?)")
-                params.extend([f"%{keyword}%", f"%{keyword}%", f"%{cat_code}%"])
-                
-        if or_clauses:
-            query += " AND (" + " OR ".join(or_clauses) + ")"
-        
-    rows = conn.execute(query, params).fetchall()
+    for _ in range(max_batches):
+        params = {
+            "search_query": query,
+            "start": start_index,
+            "max_results": batch_size,
+            "sortBy": "submittedDate",
+            "sortOrder": "descending",
+        }
 
-    papers: List[Paper] = []
-    for r in rows:
-        d = dict(r)
-        date_str = d.get("submitted_date", "2024-01-01")
-        if "T" not in date_str:
-            date_str = date_str + "T00:00:00"
-            
-        papers.append(Paper(
-            arxiv_id=d["arxiv_id"],
-            title=d["title"],
-            authors=json.loads(d.get("authors") or "[]"),
-            email_domains=[],
-            abstract=d.get("abstract") or "",
-            submitted_date=datetime.fromisoformat(date_str.replace("Z", "+00:00")),
-            pdf_url=d.get("pdf_url") or "",
-            arxiv_url=d.get("arxiv_url") or "",
-            venue=d.get("venue"),
-            source=d.get("source"),
-        ))
-    return papers
+        retries = 0
+        while True:
+            try:
+                response = requests.get(base_url, params=params, timeout=60)
+            except requests.RequestException as e:
+                st.error(f"Network error while calling arXiv: {e}")
+                return results
+
+            if response.status_code == 429:
+                retries += 1
+                if retries > max_retries:
+                    st.error("arXiv returned HTTP 429 (rate limit) repeatedly.")
+                    return results
+                wait_seconds = 30 * retries
+                st.warning(f"arXiv rate limit. Waiting {wait_seconds} seconds...")
+                time.sleep(wait_seconds)
+                continue
+
+            try:
+                response.raise_for_status()
+            except requests.HTTPError as e:
+                st.error(f"Error fetching from arXiv: {e}")
+                return results
+            break
+
+        feed = feedparser.parse(response.text)
+        if not feed.entries:
+            break
+
+        for entry in feed.entries:
+            published_str = entry.get("published", "")
+            if not published_str: continue
+            published_dt = datetime.fromisoformat(published_str.replace("Z", "+00:00"))
+            published_date = published_dt.date()
+
+            if published_date < start_date:
+                return results
+
+            arxiv_id = entry.get("id", "").split("/")[-1]
+            if arxiv_id in seen_ids:
+                continue
+            seen_ids.add(arxiv_id)
+
+            authors = [a.name for a in entry.authors] if "authors" in entry else []
+            email_domains: List[str] = []
+            pdf_url = ""
+            arxiv_url = entry.get("id", "")
+            for link in entry.links:
+                if link.rel == "alternate":
+                    arxiv_url = link.href
+                if getattr(link, "title", "") == "pdf":
+                    pdf_url = link.href
+
+            comment = entry.get("arxiv_comment", "") or entry.get("comment", "")
+            venue = extract_venue(comment)
+
+            paper = Paper(
+                arxiv_id=arxiv_id,
+                title=entry.title.strip().replace("\n", " "),
+                authors=authors,
+                email_domains=email_domains,
+                abstract=entry.summary.strip().replace("\n", " "),
+                submitted_date=published_dt,
+                pdf_url=pdf_url,
+                arxiv_url=arxiv_url,
+                venue=venue,
+            )
+            results.append(paper)
+
+        start_index += batch_size
+        time.sleep(3.0)
+
+    return results
 
 
 # =========================
@@ -713,7 +742,6 @@ def get_local_embed_model() -> SentenceTransformer:
     return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
 
-
 def embed_texts_local(texts: List[str]) -> List[List[float]]:
     if not texts: return []
     try:
@@ -734,192 +762,50 @@ def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
     return dot / (math.sqrt(norm1) * math.sqrt(norm2))
 
 
-@st.cache_resource(show_spinner=False)
-def load_bm25_index():
-    if not bm25s:
-        return None, None
-    base = get_corpus_dir()
-    bm25_path = base / "bm25_index"
-    id_map_path = base / "id_map.json"
-    if not bm25_path.exists() or not id_map_path.exists():
-        return None, None
-    try:
-        retriever = bm25s.BM25.load(str(bm25_path))
-        with open(id_map_path, "r", encoding="utf-8") as f:
-            id_map = json.load(f)
-        arxiv_to_pos = {v: int(k) for k, v in id_map.items()}
-        return retriever, arxiv_to_pos
-    except Exception as e:
-        print(f"Failed to load BM25 index: {e}")
-        return None, None
-
-def bm25_recall(papers: List[Paper], query_brief: str, retriever, arxiv_to_pos: dict, n1: int = 600) -> List[Paper]:
-    if not retriever or not papers:
-        return papers
-    # Build dictionary for O(1) fetch
-    paper_dict = {p.arxiv_id: p for p in papers}
-    
-    tokens = bm25s.tokenize([query_brief])
-    try:
-        res, scores = retriever.retrieve(tokens, k=n1)
-    except Exception as e:
-        print(f"BM25 retrieve error: {e}")
-        return papers
-    
-    positions = res[0]
-    
-    # Needs id_map inverted to map position back to arxiv_id. 
-    # But wait, we inverted the id_map to arxiv_to_pos. So we need pos_to_arxiv.
-    # Let's recreate pos_to_arxiv locally
-    pos_to_arxiv = {v: k for k, v in arxiv_to_pos.items()}
-    
-    recalled_papers = []
-    seen = set()
-    for pos in positions:
-        pos_int = int(pos)
-        arxiv_id = pos_to_arxiv.get(pos_int)
-        if arxiv_id and arxiv_id in paper_dict and arxiv_id not in seen:
-            recalled_papers.append(paper_dict[arxiv_id])
-            seen.add(arxiv_id)
-            
-    if len(recalled_papers) < 50:
-        st.info("BM25 recall found fewer than 50 intersecting papers. Skiping strict BM25 pruning.")
-        return papers
-    
-    return recalled_papers
-
-@st.cache_resource(show_spinner=False)
-def load_precomputed_embeddings():
-    base = get_corpus_dir()
-    emb_path = base / "embeddings_minilm.npy"
-    if not emb_path.exists():
-        return None
-    try:
-        return np.load(str(emb_path), mmap_mode='r')
-    except Exception as e:
-        print(f"Failed to load precomputed embeddings: {e}")
-        return None
-
-def minilm_vector_rerank(papers: List[Paper], query_brief: str, embeddings: Optional[np.ndarray], arxiv_to_pos: dict, n2: int = 300) -> List[Paper]:
-    if not papers: return []
-    if embeddings is None or not arxiv_to_pos:
-        # Fallback to runtime embed
-        texts = [p.title + "\n\n" + p.abstract for p in papers]
-        paper_vecs = embed_texts_local(texts)
-        q_vec = embed_texts_local([query_brief])[0]
-        scored = []
-        for p, vec in zip(papers, paper_vecs):
-            sim = cosine_similarity(q_vec, vec)
-            p.semantic_relevance = sim
-            scored.append((sim, p))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        k = min(n2, len(scored))
-        return [p for _, p in scored[:k]]
-        
-    try:
-        model = get_local_embed_model()
-        q_vec = model.encode([query_brief], normalize_embeddings=True)[0]
-    except Exception as e:
-        print(f"Local query embed error: {e}")
-        return papers
-
-    scored = []
-    # Collect indices for batch extraction if possible, or dot product individually
-    for p in papers:
-        pos = arxiv_to_pos.get(p.arxiv_id)
-        if pos is not None and pos < embeddings.shape[0]:
-            vec = embeddings[pos]
-            sim = float(np.dot(vec, q_vec))
-        else:
-            sim = 0.0 # Paper not in index
-        p.semantic_relevance = sim
-        scored.append((sim, p))
-        
-    scored.sort(key=lambda x: x[0], reverse=True)
-    k = min(n2, len(scored))
-    return [p for _, p in scored[:k]]
-
-@st.cache_resource(show_spinner=False)
-def get_cross_encoder_model():
-    try:
-        from sentence_transformers import CrossEncoder
-        st.info("Loading CrossEncoder model for precision re-ranking (first run only)…")
-        return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-    except Exception as e:
-        print(f"CrossEncoder load error: {e}")
-        return None
-
-def cross_encoder_rerank(papers: List[Paper], query_brief: str, n3: int = 150) -> List[Paper]:
-    if not papers: return []
-    model = get_cross_encoder_model()
-    if not model:
-        # Fallback, just return top-N of whatever they came in as
-        return papers[:n3]
-        
-    pairs = [[query_brief, p.title + "\n\n" + p.abstract] for p in papers]
-    try:
-        scores = model.predict(pairs)
-        # normalize to 0-1 range roughly using sigmoid if we want it to look like cosine, 
-        # or just sort by raw logits for reranking.
-        # We will sort by raw logit, but we can set semantic_relevance to an arbitrary 0-1 scale.
-        
-        scored = []
-        for p, score in zip(papers, scores):
-            score_float = float(score)
-            # Sigmoid normalization for relevance
-            p.semantic_relevance = 1 / (1 + math.exp(-score_float)) 
-            scored.append((score_float, p))
-            
-        scored.sort(key=lambda x: x[0], reverse=True)
-        k = min(n3, len(scored))
-        return [p for _, p in scored[:k]]
-    except Exception as e:
-        print(f"CrossEncoder predict error: {e}")
-        return papers[:n3]
-
-
 def select_embedding_candidates(
     papers: List[Paper],
     query_brief: str,
-    llm_config: Optional[LLMConfig] = None,
-    embedding_model: str = "",
-    provider: str = "",
+    llm_config: Optional[LLMConfig],
+    embedding_model: str,
+    provider: str,
     max_candidates: int = 150,
 ) -> List[Paper]:
-    """
-    3-Stage Hybrid Search:
-    Stage 1: BM25 Lexical Recall (narrow down to Top 600)
-    Stage 2: MiniLM Vector Lookup (narrow down to Top 300)
-    Stage 3: CrossEncoder Precision Rerank (narrow down to Top 150)
-    """
     if not papers: return []
-    
-    st.write(f"Starting 3-stage hybrid search from {len(papers)} SQLite candidates...")
 
-    # Load artifacts
-    bm25_retriever, arxiv_to_pos = load_bm25_index()
-    embeddings = load_precomputed_embeddings()
+    # 1) Embed the query
+    try:
+        if provider == "openai":
+            query_vec = embed_texts_openai([query_brief], llm_config, embedding_model)[0]
+        elif provider == "gemini":
+            query_vec = embed_texts_gemini([query_brief], llm_config, embedding_model)[0]
+        else:
+            # "free_local" OR "groq" uses local embeddings
+            query_vec = embed_texts_local([query_brief])[0]
+    except Exception:
+        return papers
 
-    # Stage 1: BM25 Recall
-    if bm25_retriever and arxiv_to_pos:
-        st.write("⏱ Stage 1: BM25 lexical recall...")
-        stage1_papers = bm25_recall(papers, query_brief, bm25_retriever, arxiv_to_pos, n1=600)
-        st.write(f"✅ BM25 selected {len(stage1_papers)} candidates.")
-    else:
-        st.warning("BM25 index not found. Skipping Stage 1.")
-        stage1_papers = papers
+    # 2) Embed all papers
+    texts = [p.title + "\n\n" + p.abstract for p in papers]
+    try:
+        if provider == "openai":
+            paper_vecs = embed_texts_openai(texts, llm_config, embedding_model)
+        elif provider == "gemini":
+            paper_vecs = embed_texts_gemini(texts, llm_config, embedding_model)
+        else:
+            # "free_local" OR "groq" uses local embeddings
+            paper_vecs = embed_texts_local(texts)
+    except Exception:
+        return papers
 
-    # Stage 2: MiniLM Semantic Filter
-    st.write("⏱ Stage 2: MiniLM vector semantic filter...")
-    stage2_papers = minilm_vector_rerank(stage1_papers, query_brief, embeddings, arxiv_to_pos if arxiv_to_pos else {}, n2=300)
-    st.write(f"✅ Vector reranking selected {len(stage2_papers)} candidates.")
-    
-    # Stage 3: CrossEncoder Precision Rerank
-    st.write("⏱ Stage 3: Cross-Encoder precision reranking...")
-    stage3_papers = cross_encoder_rerank(stage2_papers, query_brief, n3=max_candidates)
-    st.write(f"✅ Cross-Encoder selected {len(stage3_papers)} final candidates.")
+    scored = []
+    for p, vec in zip(papers, paper_vecs):
+        sim = cosine_similarity(query_vec, vec)
+        p.semantic_relevance = sim
+        scored.append((sim, p))
 
-    return stage3_papers
+    scored.sort(key=lambda x: x[0], reverse=True)
+    k = min(max_candidates, len(scored))
+    return [p for _, p in scored[:k]]
 
 
 # =========================
@@ -1298,21 +1184,17 @@ PIPELINE_DESCRIPTION_MD = """
 
 You write a short research brief in natural language about the kind of work you care about, and optionally what you are not interested in. If you leave both fields empty, the agent switches to a global mode and just looks for the most impactful recent Computer Science papers overall.
 
-#### 2. The agent searches a curated local corpus
+#### 2. The agent fetches recent arXiv papers
 
-Instead of fetching papers live, the agent queries a pre-built local library of 40,000+ papers harvested from arXiv and Semantic Scholar. This library is refreshed on a schedule via a pipeline and, when configured, synced from cloud storage (Cloudflare R2) on startup — so you always get fast, up-to-date results without depending on external API availability at search time.
+It fetches up to about 5000 papers from arxiv.org for the date range you choose, using your selected arXiv category filters—either all categories, or a specific main category (like Computer Science) with one or more subcategories (like cs.AI, cs.LG etc.). It does this carefully, respecting arXiv's API rate limits.
+#### 3. The agent picks candidate papers
 
-#### 3. The agent picks candidate papers using 3-stage hybrid search
-
-Retrieval is a three-step funnel designed to be both fast and accurate:
-
-- **Stage 1 — Keyword Recall (BM25):** Quickly narrows the corpus to papers containing terminology relevant to your brief.
-- **Stage 2 — Semantic Filter (MiniLM):** An embedding model removes keyword matches that aren't actually relevant to the *meaning* of your query, keeping the top candidates by semantic similarity.
-- **Stage 3 — Precision Reranking (CrossEncoder):** A deep cross-attention model does a final comparison between your brief and each candidate, selecting the best papers to pass to the AI.
+- In **targeted mode**, the agent uses embeddings to measure how close each paper's title and abstract are to your brief in meaning and keeps the top 150 as candidates.
+- In **global mode**, it simply takes the most recent 150  papers as candidates.
 
 #### The agent filters by venue (Optional)
 
-If you selected a venue filter (e.g. "NeurIPS only" or "All Journals"), the agent applies it **after** the hybrid search. This ensures the agent first identifies the most semantically relevant papers from the entire corpus, and then narrows them down to your preferred venues.
+If you selected a venue filter (e.g. "NeurIPS only" or "All Journals"), the agent applies it **after** the embedding search. This ensures that the agent first identifies the most semantically relevant papers from the entire pool, and then narrows them down to your preferred venues.
 
 #### 4. The agent judges how relevant each paper is
 
@@ -1329,7 +1211,7 @@ The agent builds a set of papers to send to the citation impact step:
 
 #### 6. The agent computes 1-year citation impact scores
 
-- In **LLM API mode** (OpenAI, Gemini, or Groq), a model estimates a 1-year citation impact score for each paper using author citation data from Semantic Scholar and an LLM-generated narrative, and provides short explanations.
+- In **LLM API mode** (OpenAI, Gemini, or Groq), a model estimates a 1-year citation impact score for each paper and provides short explanations.
 - In **free local mode**, the agent derives a citation impact score from the relevance signals and uses that to rank papers.
 
 These scores are heuristic impact signals and are best used for ranking within this batch, not as ground truth.
@@ -1374,9 +1256,6 @@ def main():
         page_title="Research Agent",
         layout="wide",
     )
-
-    # Startup sync from Cloudflare R2
-    download_corpus_artifacts()
 
     # ===== FOOTER (injected early so no early return can skip it) =====
     # Uses CSS to push itself to the bottom of the viewport when content is short,
@@ -1482,7 +1361,7 @@ def _main_body():
                 format_func=lambda x: f"{ARXIV_CODE_TO_NAME.get(x, x)} ({x})",
                 help="If you choose none, we'll use ALL subcategories from the selected main category."
             )
-        # Build query string to pass into fetch (currently unused by SQL, available for expansions)
+        # Build query string to pass into fetch
         arxiv_query = build_arxiv_category_query(main_cat, subcats)
 
         # --- Venue Filtering UI ---
@@ -1668,7 +1547,6 @@ def _main_body():
         run_clicked = st.button("🚀 Run Pipeline")
 
     if run_clicked:
-        _check_corpus_freshness()
         st.session_state["hide_pipeline_description"] = True
 
     hide_desc = st.session_state.get("hide_pipeline_description", False)
@@ -1709,8 +1587,6 @@ def _main_body():
         "venue_filter_type": venue_filter_type,
         "selected_category": selected_category,
         "selected_venues": selected_venues,
-        "main_cat": main_cat,
-        "subcats": subcats,
     }
 
     if "last_params" not in st.session_state:
@@ -1824,56 +1700,49 @@ def _main_body():
     st.session_state["config"] = config
     save_json(os.path.join(project_folder, "config.json"), config)
 
-    # 2. Fetch current papers from local corpus
-    st.subheader("2. Fetch Current Papers from Corpus")
+    # 2. Fetch current papers
+    st.subheader("2. Fetch Current Papers from arXiv according to your selected Category and Subcategory")
 
     if run_clicked or "current_papers" not in st.session_state:
-        # --- Primary path: local SQLite corpus ---
-        with st.spinner("Loading papers from local SQLite corpus by date window..."):
-            current_papers = fetch_papers_from_db(
+        with st.spinner("Fetching current papers from arXiv by date window..."):
+            current_papers = fetch_arxiv_papers_by_date(
                 start_date=current_start,
                 end_date=current_end,
-                category_filter=st.session_state.get("last_params", {}).get("main_cat", None),
-                subcats=st.session_state.get("last_params", {}).get("subcats", None)
+                arxiv_query=arxiv_query,
+
             )
-
-        if current_papers:
-            st.success(f"Loaded {len(current_papers)} papers from local corpus in this date range.")
-        else:
-            st.info("No papers found in local corpus for this specific date range.")
-
-        # Apply venue filtering IMMEDIATELY
-        before_v = len(current_papers)
-        current_papers = filter_papers_by_venue(
-            current_papers,
-            venue_filter_type,
-            selected_category,
-            selected_venues
-        )
-        after_v = len(current_papers)
-        
-        if venue_filter_type != "None":
-            display_sel = ", ".join(selected_venues) if selected_venues else ""
-            name_string = f" → {display_sel}" if display_sel else ""
-            st.info(
-                f"Venue filter `{venue_filter_type}` applied{name_string}. "
-                f"Remaining: {after_v} (Filtered out {before_v - after_v})"
-            )
-
         st.session_state["current_papers"] = current_papers
     else:
         current_papers = st.session_state["current_papers"]
 
     if not current_papers:
-        st.warning("No papers found for this date/venue combination. Please adjust filters.")
+        st.warning("No papers found for this date range (or arXiv stopped responding).")
         return
 
+    st.success(
+        f"Fetched {len(current_papers)}  papers in this date range and Category/Subcategory Selected "
+        "(before any candidate selection)."
+    )
+
     # Apply NOT filter provider-agnostically
+    # NOT filter
     if not_text:
         current_papers, removed_count = filter_papers_by_not_terms(current_papers, not_text)
         st.info(f"Excluded {removed_count} papers whose title or abstract contained NOT terms.")
 
+    # DO NOT apply venue filter here.
+    # Save the venue settings for later use after embeddings.
+    st.session_state["venue_filter_type"] = venue_filter_type
+    st.session_state["selected_category"] = selected_category
+    st.session_state["selected_venues"] = selected_venues
+
+    # 🔴 DELETED EARLY FILTER: Logic moved to AFTER embeddings to prevent blinding the model.
+
     st.session_state["current_papers"] = current_papers
+
+    if not current_papers:
+        st.warning("All papers were filtered out. Relax filters or pick another date range.")
+        return
 
     save_json(
         os.path.join(project_folder, "current_papers_all.json"),
@@ -1917,6 +1786,32 @@ def _main_body():
             candidates = st.session_state["candidates"]
 
         st.success(f"{len(candidates)} top candidates selected by embedding similarity for further filtering.")
+
+    # Apply venue filtering AFTER embeddings ✨
+    venue_filter_type = st.session_state.get("venue_filter_type", "None")
+    selected_category = st.session_state.get("selected_category", None)
+    selected_venues = st.session_state.get("selected_venues", [])
+
+    before_v = len(candidates)
+    candidates = filter_papers_by_venue(
+        candidates,
+        venue_filter_type,
+        selected_category,
+        selected_venues
+    )
+    after_v = len(candidates)
+
+    if venue_filter_type != "None":
+        display_sel = ", ".join(selected_venues) if selected_venues else ""
+        if display_sel:
+            name_string = f" → {display_sel}"
+        else:
+            name_string = ""
+
+        st.info(
+            f"Venue filter `{venue_filter_type}` applied{name_string}. "
+            f"Remaining: {after_v} (Filtered out {before_v - after_v})"
+        )
 
     save_json(
         os.path.join(project_folder, "candidates_embedding_selected.json"),
