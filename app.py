@@ -123,35 +123,40 @@ def save_json(path: str, obj: Any):
 def get_corpus_dir() -> pathlib.Path:
     """
     Returns the writable directory for data pipeline artifacts.
-    Checks environment variables, local folder writability, and falls back
-    to a platform-agnostic temp directory (crucial for Cloud deployments).
+
+    Priority:
+      1. CORPUS_DATA_DIR env var  (explicit override)
+      2. ./data_pipeline/         (local dev — only if writable)
+      3. <tempdir>/researchagent_corpus  (Streamlit Cloud / read-only containers)
+
+    The folder name in step 3 is always 'researchagent_corpus' — it is NOT
+    tied to the R2 bucket name so it stays stable across bucket renames.
     """
-    # 1. Manual override via environment variable
+    # 1. Manual override
     env_dir = os.environ.get("CORPUS_DATA_DIR")
     if env_dir:
         p = pathlib.Path(env_dir)
         p.mkdir(parents=True, exist_ok=True)
         return p
-    local_dir = pathlib.Path("data_pipeline")
-    
-    # 2. Check for Streamlit Cloud or forced cloud mode
-    is_streamlit_cloud = os.getenv("STREAMLIT_SHARING_MODE") is not None
-    
-    # 3. If NOT on cloud, try using the local project folder (ideal for local dev)
-    if not is_streamlit_cloud:
+
+    # 2. Local dev: use the repo data_pipeline/ folder if it is writable
+    # STREAMLIT_SHARING_MODE is auto-set by Streamlit Cloud — never set it manually.
+    is_cloud = os.getenv("STREAMLIT_SHARING_MODE") is not None
+    if not is_cloud:
+        local_dir = pathlib.Path("data_pipeline")
         try:
             local_dir.mkdir(parents=True, exist_ok=True)
-            # Verify writability by touching a dummy file
-            test_file = local_dir / ".write_test"
-            test_file.touch()
-            test_file.unlink()
+            probe = local_dir / ".write_test"
+            probe.touch()
+            probe.unlink()
             return local_dir
         except (OSError, PermissionError):
-            # If local directory is read-only (common in many cloud setups)
-            pass
-    # 4. Final Fallback: Platform-agnostic system temp directory
-    # This ensures it works on Windows, Linux, and Mac regardless of cloud provider.
-    temp_path = pathlib.Path(tempfile.gettempdir()) / "researchagent_test"
+            pass  # repo is read-only → fall through to temp
+
+    # 3. Streamlit Cloud / read-only environments → writable system temp
+    # Folder name is fixed so every call within a container session resolves
+    # to the same path (important for @st.cache_resource consistency).
+    temp_path = pathlib.Path(tempfile.gettempdir()) / "researchagent_corpus"
     temp_path.mkdir(parents=True, exist_ok=True)
     return temp_path
 
@@ -1057,7 +1062,8 @@ def predict_citations_direct(target_papers: List[Paper], llm_config: LLMConfig, 
             with open("moneyball_weights.json", "r") as f: weights = json.load(f)
         except: pass
     
-    s2_key = os.getenv("S2_API_KEY") 
+    # Read S2 key from st.secrets (Streamlit Cloud) with os.getenv fallback (local/.env)
+    s2_key = st.secrets.get("S2_API_KEY") or os.getenv("S2_API_KEY")
     progress_bar = st.progress(0)
     
     for i, p in enumerate(target_papers):
